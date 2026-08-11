@@ -1,5 +1,6 @@
 #include "platform_linux.h"
 #include "bm_config.h"
+#include "critical_op.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -423,6 +424,8 @@ BmErr bm_dfu_client_flash_area_open(const void **flash_area) {
     return BmEIO;
   }
   *flash_area = &s_flash_area_tag;
+
+  sbc_critical_op(true);
   return BmOK;
 }
 
@@ -560,6 +563,8 @@ BmErr bm_dfu_client_set_pending_and_reset(void) {
 BmErr bm_dfu_client_set_confirmed(void) {
   unlink(s_marker_path);
   unlink(s_backup_path);
+
+  sbc_critical_op(false);
   return BmOK;
 }
 

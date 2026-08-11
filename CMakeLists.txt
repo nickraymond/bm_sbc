@@ -75,6 +75,7 @@ add_library(bm_sbc_core STATIC
   src/core/runtime.cpp
   src/core/app_runner.cpp
   src/core/pcap_file_sink.cpp
+  src/core/critical_op.c
   src/platform/linux/platform_linux.cpp
   src/net/virtual_port_device.cpp
   src/net/gateway_device.cpp
