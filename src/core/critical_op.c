@@ -1,13 +1,14 @@
 #include "bm_log.h"
 #include "bm_os.h"
 #include "bm_service_request.h"
+#include "device.h"
 #include "util.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
-#define CRITICAL_SERVICE_PATH_CAP = 64;
+#define CRITICAL_SERVICE_PATH_CAP 64
 #define TIMER_TIMEOUT_MS 2000
 #define SERVICE_REQUEST_TIMEOUT_S 1
 #define TIMER_MAX_WAIT_MS 5
@@ -24,10 +25,12 @@ static bool critical_service_request_cb(bool ack, uint32_t msg_id,
                                         size_t service_strlen,
                                         const char *service, size_t reply_len,
                                         uint8_t *reply_data) {
-  bm_log_info("%s: received reply on service %.*s", __func__, service_strlen,
-              service);
+  bm_log_info("%s: received reply on service %.*s", __func__,
+              (int)service_strlen, service);
 
   bm_timer_stop(ctx.timer, TIMER_MAX_WAIT_MS);
+
+  return true;
 }
 
 static void send_request(bool critical) {
@@ -47,7 +50,8 @@ static void send_request(bool critical) {
   }
 }
 
-void critical_timer_cb(BmTimer *timer) {
+static void critical_timer_cb(BmTimer timer) {
+  (void)timer;
   bm_semaphore_take(ctx.mut, BM_MAX_DELAY_UINT32);
   send_request(ctx.critical_status);
   bm_semaphore_give(ctx.mut);
