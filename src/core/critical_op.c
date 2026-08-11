@@ -25,6 +25,11 @@ static bool critical_service_request_cb(bool ack, uint32_t msg_id,
                                         size_t service_strlen,
                                         const char *service, size_t reply_len,
                                         uint8_t *reply_data) {
+  (void)msg_id;
+  (void)ack;
+  (void)reply_data;
+  (void)reply_len;
+
   bm_log_info("%s: received reply on service %.*s", __func__,
               (int)service_strlen, service);
 
@@ -44,7 +49,9 @@ static void send_request(bool critical) {
     return;
   }
 
-  if (!bm_service_request(n, service, 0, NULL, critical_service_request_cb,
+  uint8_t data = !critical;
+  if (!bm_service_request(n, service, sizeof(data), &data,
+                          critical_service_request_cb,
                           SERVICE_REQUEST_TIMEOUT_S)) {
     bm_log_error("%s: bm_service_request failed", __func__);
   }
@@ -57,6 +64,18 @@ static void critical_timer_cb(BmTimer timer) {
   bm_semaphore_give(ctx.mut);
 }
 
+/*!
+ @brief Sets the device in a critical state
+
+ @details This prevents the device from being powered off. The neighboring
+          device must register a service under:
+            borealis/{sbc_node_id}/critical
+          This function will send a request on the aformentioned service,
+          and attempt to send a request on that service every 2 seconds until
+          the neighbor replies.
+
+ @param critical whether device is in a critical operation or not
+ */
 void sbc_critical_op(bool critical) {
   if (!ctx.mut) {
     ctx.mut = bm_mutex_create();
