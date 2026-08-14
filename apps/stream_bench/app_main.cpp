@@ -200,10 +200,14 @@ void loop(void) {
       }
     } else {
       double win_mbps = (double)s_rx_bytes_win * 8.0 / 1e6;
+      // tx_drops on an rx-role node = L2 FORWARD-path drops (the L2
+      // thread enqueueing into its own full queue) — the transit ledger
+      // on a pass-through node like the S16 Light Pi.
       printf("RX_STAT t=%.0f mbps=%.2f msgs=%" PRIu64 " total_mb=%.2f "
-             "total_msgs=%" PRIu64 " rx_drops=%" PRIu32 "\n",
+             "total_msgs=%" PRIu64 " rx_drops=%" PRIu32 " tx_drops=%" PRIu32
+             "\n",
              t, win_mbps, s_rx_msgs_win, (double)s_rx_bytes / 1e6, s_rx_msgs,
-             bm_l2_get_rx_queue_drops());
+             bm_l2_get_rx_queue_drops(), bm_l2_get_tx_queue_drops());
       s_rx_bytes_win = 0;
       s_rx_msgs_win = 0;
     }
