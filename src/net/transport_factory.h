@@ -20,6 +20,7 @@
 
 #include "network_device.h"
 #include "transport_kind.h"
+#include "udp_port_device.h"
 #include "virtual_port_device.h"
 
 typedef struct {
@@ -29,6 +30,9 @@ typedef struct {
   /// Base config for virtual/serial transports (node id, socket dir, peers).
   /// Also carries own_node_id for every other transport.
   VirtualPortCfg vpc;
+
+  /// Base config for the udp transport (listen endpoint, peers, rate limit).
+  UdpPortCfg udp;
 
   /// Serial device path ("" = no gateway wrapper).  Required for `serial`.
   const char *uart_path;

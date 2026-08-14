@@ -56,8 +56,19 @@ int transport_factory_create(const TransportFactoryCfg *cfg,
   }
 
   case TransportUdp: {
-    bm_log_error("transport=udp not implemented yet (BUILD-1 lands next)");
-    return 1;
+    NetworkDevice base = udp_port_device_get(&cfg->udp);
+    if (gateway_mode) {
+      int uart_err = uart_l2_transport_init(cfg->uart_path, cfg->baud_rate,
+                                            gateway_uart_rx_cb, nullptr);
+      if (uart_err != 0) {
+        bm_log_error("UART transport init failed");
+        return 1;
+      }
+      *out = gateway_device_get(&base);
+    } else {
+      *out = base;
+    }
+    return 0;
   }
 
   case TransportAdin: {

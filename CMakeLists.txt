@@ -81,6 +81,8 @@ add_library(bm_sbc_core STATIC
   src/net/gateway_ipc.cpp
   src/net/transport_kind.c
   src/net/transport_factory.cpp
+  src/net/udp_port_util.c
+  src/net/udp_port_device.cpp
   src/transports/uart_l2/cobs.c
   src/transports/uart_l2/crc32c.c
   src/transports/uart_l2/frame_codec.c
@@ -230,3 +232,12 @@ target_include_directories(test_transport_kind PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src/net
 )
 add_test(NAME transport_kind COMMAND test_transport_kind)
+
+add_executable(test_udp_port_util
+  tests/test_udp_port_util.c
+  src/net/udp_port_util.c
+)
+target_include_directories(test_udp_port_util PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/net
+)
+add_test(NAME udp_port_util COMMAND test_udp_port_util)

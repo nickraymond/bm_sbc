@@ -43,6 +43,12 @@ static const char *k_usage =
     "  --socket-dir <path>    Unix socket directory (default: /tmp).\n"
     "  --uart       <device>  Serial device path for UART gateway mode.\n"
     "  --baud       <rate>    Baud rate for UART (default: 115200).\n"
+    "  --udp-listen <ip:port> UDP transport bind endpoint\n"
+    "                         (default: 0.0.0.0:22000).\n"
+    "  --udp-peer   <ip:port> A UDP peer endpoint, in port-slot order;\n"
+    "                         repeat up to 15 times.\n"
+    "  --udp-rate-mbps <n>    UDP TX rate limit in Mbit/s; 0 disables\n"
+    "                         (default: 10, 10BASE-T1L emulation).\n"
     "  --pcap       <path>    Write captured L2 frames to a pcap file.\n"
     "\n"
     "  --log-dir    <path>    Log file directory (default: /var/log/bm_sbc).\n"
@@ -92,9 +98,18 @@ static int parse_log_level(const char *s) {
 /// Uses the tomlc17 API: toml_parse_file_ex() / toml_get() / toml_free().
 /// Strings returned by toml_get() point into the parsed document memory and
 /// must NOT be free()'d individually — toml_free() releases everything.
+/// Raw (unparsed) UDP transport settings as read from CLI/TOML.
+typedef struct {
+  char listen[64];                                    // "" = default
+  char peers[VIRTUAL_PORT_CFG_MAX_PEERS][64];         // "ip:port" strings
+  uint8_t num_peers;
+  int rate_mbps;                                      // -1 = not set
+} UdpRawCfg;
+
 static int load_init_file(const char *path, VirtualPortCfg *vpc,
                           bool *node_id_set, char *cfg_dir, size_t cfg_dir_sz,
                           char *transport_str, size_t transport_str_sz,
+                          UdpRawCfg *udp_raw,
                           char *uart_path, size_t uart_path_sz, int *baud_rate,
                           char *pcap_path, size_t pcap_path_sz, char *log_dir,
                           size_t log_dir_sz, int *log_level, bool *log_stdout) {
@@ -155,6 +170,39 @@ static int load_init_file(const char *path, VirtualPortCfg *vpc,
   if (d.type == TOML_STRING) {
     strncpy(transport_str, d.u.s, transport_str_sz - 1);
     transport_str[transport_str_sz - 1] = '\0';
+  }
+
+  // udp-listen (string, "ip:port")
+  d = toml_get(root, "udp-listen");
+  if (d.type == TOML_STRING) {
+    strncpy(udp_raw->listen, d.u.s, sizeof(udp_raw->listen) - 1);
+    udp_raw->listen[sizeof(udp_raw->listen) - 1] = '\0';
+  }
+
+  // udp-peers (array of "ip:port" strings, port-slot order)
+  toml_datum_t udp_peers_arr = toml_get(root, "udp-peers");
+  if (udp_peers_arr.type == TOML_ARRAY) {
+    for (int i = 0; i < udp_peers_arr.u.arr.size; i++) {
+      if (udp_raw->num_peers >= VIRTUAL_PORT_CFG_MAX_PEERS) {
+        fprintf(stderr, "bm_sbc: too many udp-peers in %s (max %d)\n", path,
+                VIRTUAL_PORT_CFG_MAX_PEERS);
+        break;
+      }
+      toml_datum_t elem = udp_peers_arr.u.arr.elem[i];
+      if (elem.type == TOML_STRING) {
+        strncpy(udp_raw->peers[udp_raw->num_peers], elem.u.s,
+                sizeof(udp_raw->peers[0]) - 1);
+        udp_raw->peers[udp_raw->num_peers]
+                      [sizeof(udp_raw->peers[0]) - 1] = '\0';
+        udp_raw->num_peers++;
+      }
+    }
+  }
+
+  // udp-rate-mbps (int; 0 disables shaping)
+  d = toml_get(root, "udp-rate-mbps");
+  if (d.type == TOML_INT64) {
+    udp_raw->rate_mbps = (int)d.u.int64;
   }
 
   // uart-device (string)
@@ -249,6 +297,9 @@ int bm_sbc_runtime_init(int argc, char **argv, const char *app_name) {
   bool node_id_set = false;
   char cfg_dir[512] = {0};
   char transport_str[16] = {0}; // empty = default (virtual)
+  UdpRawCfg udp_raw;
+  memset(&udp_raw, 0, sizeof(udp_raw));
+  udp_raw.rate_mbps = -1; // -1 = not set (default applied later)
   char uart_path[128] = {0};
   char pcap_path[256] = {0};
   int baud_rate = 115200;
@@ -279,6 +330,9 @@ int bm_sbc_runtime_init(int argc, char **argv, const char *app_name) {
       {"socket-dir", required_argument, NULL, 's'},
       {"uart", required_argument, NULL, 'u'},
       {"baud", required_argument, NULL, 'b'},
+      {"udp-listen", required_argument, NULL, 'L'},
+      {"udp-peer", required_argument, NULL, 'P'},
+      {"udp-rate-mbps", required_argument, NULL, 'R'},
       {"pcap", required_argument, NULL, 'w'},
       {"log-dir", required_argument, NULL, 'd'},
       {"log-level", required_argument, NULL, 'l'},
@@ -343,6 +397,32 @@ int bm_sbc_runtime_init(int argc, char **argv, const char *app_name) {
       }
       break;
     }
+    case 'L': {
+      strncpy(udp_raw.listen, optarg, sizeof(udp_raw.listen) - 1);
+      break;
+    }
+    case 'P': {
+      if (udp_raw.num_peers >= VIRTUAL_PORT_CFG_MAX_PEERS) {
+        fprintf(stderr,
+                "bm_sbc: too many --udp-peer flags (max %d); ignoring %s\n",
+                VIRTUAL_PORT_CFG_MAX_PEERS, optarg);
+        break;
+      }
+      strncpy(udp_raw.peers[udp_raw.num_peers], optarg,
+              sizeof(udp_raw.peers[0]) - 1);
+      udp_raw.num_peers++;
+      break;
+    }
+    case 'R': {
+      char *end = NULL;
+      udp_raw.rate_mbps = (int)strtol(optarg, &end, 10);
+      if (!end || *end != '\0' || udp_raw.rate_mbps < 0) {
+        fprintf(stderr, "bm_sbc: invalid --udp-rate-mbps value: %s\n", optarg);
+        fprintf(stderr, "%s", k_usage);
+        return 1;
+      }
+      break;
+    }
     case 'w': {
       strncpy(pcap_path, optarg, sizeof(pcap_path) - 1);
       break;
@@ -381,6 +461,7 @@ int bm_sbc_runtime_init(int argc, char **argv, const char *app_name) {
     strncpy(cli_cfg_dir, cfg_dir, sizeof(cli_cfg_dir));
     char cli_transport_str[sizeof(transport_str)];
     strncpy(cli_transport_str, transport_str, sizeof(cli_transport_str));
+    UdpRawCfg cli_udp_raw = udp_raw;
     char cli_socket_dir[sizeof(vpc.socket_dir)];
     strncpy(cli_socket_dir, vpc.socket_dir, sizeof(cli_socket_dir));
     uint8_t cli_num_peers = vpc.num_peers;
@@ -403,6 +484,8 @@ int bm_sbc_runtime_init(int argc, char **argv, const char *app_name) {
     node_id_set = false;
     memset(cfg_dir, 0, sizeof(cfg_dir));
     memset(transport_str, 0, sizeof(transport_str));
+    memset(&udp_raw, 0, sizeof(udp_raw));
+    udp_raw.rate_mbps = -1;
     memset(uart_path, 0, sizeof(uart_path));
     memset(pcap_path, 0, sizeof(pcap_path));
     baud_rate = 115200;
@@ -412,7 +495,7 @@ int bm_sbc_runtime_init(int argc, char **argv, const char *app_name) {
 
     int rc = load_init_file(init_path, &vpc, &node_id_set, cfg_dir,
                             sizeof(cfg_dir), transport_str,
-                            sizeof(transport_str), uart_path,
+                            sizeof(transport_str), &udp_raw, uart_path,
                             sizeof(uart_path), &baud_rate, pcap_path,
                             sizeof(pcap_path), log_dir, sizeof(log_dir),
                             &log_level, &log_stdout_flag);
@@ -430,6 +513,16 @@ int bm_sbc_runtime_init(int argc, char **argv, const char *app_name) {
     }
     if (cli_transport_str[0] != '\0') {
       strncpy(transport_str, cli_transport_str, sizeof(transport_str) - 1);
+    }
+    if (cli_udp_raw.listen[0] != '\0') {
+      strncpy(udp_raw.listen, cli_udp_raw.listen, sizeof(udp_raw.listen) - 1);
+    }
+    if (cli_udp_raw.num_peers > 0) {
+      memcpy(udp_raw.peers, cli_udp_raw.peers, sizeof(udp_raw.peers));
+      udp_raw.num_peers = cli_udp_raw.num_peers;
+    }
+    if (cli_udp_raw.rate_mbps >= 0) {
+      udp_raw.rate_mbps = cli_udp_raw.rate_mbps;
     }
     if (strcmp(cli_socket_dir, VIRTUAL_PORT_DEFAULT_SOCKET_DIR) != 0) {
       strncpy(vpc.socket_dir, cli_socket_dir, sizeof(vpc.socket_dir) - 1);
@@ -527,6 +620,33 @@ int bm_sbc_runtime_init(int argc, char **argv, const char *app_name) {
   tf_cfg.vpc = vpc;
   tf_cfg.uart_path = uart_path;
   tf_cfg.baud_rate = baud_rate;
+
+  if (transport_kind == TransportUdp) {
+    tf_cfg.udp.own_node_id = vpc.own_node_id;
+    // Bench default: 10 Mbps shaper (10BASE-T1L emulation); 0 disables.
+    tf_cfg.udp.rate_mbps =
+        (udp_raw.rate_mbps >= 0) ? (uint32_t)udp_raw.rate_mbps : 10;
+    const char *listen =
+        udp_raw.listen[0] != '\0' ? udp_raw.listen : "0.0.0.0:22000";
+    if (!udp_endpoint_parse(listen, tf_cfg.udp.listen_ip,
+                            sizeof(tf_cfg.udp.listen_ip),
+                            &tf_cfg.udp.listen_port)) {
+      fprintf(stderr, "bm_sbc: invalid udp-listen value: %s\n", listen);
+      fprintf(stderr, "%s", k_usage);
+      return 1;
+    }
+    for (uint8_t i = 0; i < udp_raw.num_peers; i++) {
+      if (!udp_endpoint_parse(udp_raw.peers[i], tf_cfg.udp.peers[i].ip,
+                              sizeof(tf_cfg.udp.peers[i].ip),
+                              &tf_cfg.udp.peers[i].port)) {
+        fprintf(stderr, "bm_sbc: invalid udp-peer value: %s\n",
+                udp_raw.peers[i]);
+        fprintf(stderr, "%s", k_usage);
+        return 1;
+      }
+    }
+    tf_cfg.udp.num_peers = udp_raw.num_peers;
+  }
 
   NetworkDevice net_dev;
   if (transport_factory_create(&tf_cfg, &net_dev) != 0) {
