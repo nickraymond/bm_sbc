@@ -1,11 +1,10 @@
 #include "runtime.h"
 #include "bm_config.h"
 #include "bm_log.h"
-#include "gateway_device.h"
 #include "pcap_file_sink.h"
 #include "platform_linux.h"
 #include "timer_callback_handler.h"
-#include "uart_l2_transport.h"
+#include "transport_factory.h"
 #include "virtual_port_device.h"
 // topology.h, bm_service.h, l2.h, pubsub.h have extern "C" guards.
 // device.h, bm_ip.h, bcmp.h, middleware.h do not — wrap them explicitly.
@@ -37,6 +36,7 @@ static const char *k_usage =
     "\n"
     "  --init       <path>    TOML init file (provides all settings below).\n"
     "  --node-id    <hex64>   This node's 64-bit Bristlemouth node ID.\n"
+    "  --transport  <name>    Transport: virtual (default), udp, serial, adin.\n"
     "  --cfg-dir    <path>    Directory for config partition files.\n"
     "  --peer       <hex64>   A peer node ID; repeat up to 15 times.\n"
     "                         (16 peers triggers a truncation warning)\n"
@@ -94,6 +94,7 @@ static int parse_log_level(const char *s) {
 /// must NOT be free()'d individually — toml_free() releases everything.
 static int load_init_file(const char *path, VirtualPortCfg *vpc,
                           bool *node_id_set, char *cfg_dir, size_t cfg_dir_sz,
+                          char *transport_str, size_t transport_str_sz,
                           char *uart_path, size_t uart_path_sz, int *baud_rate,
                           char *pcap_path, size_t pcap_path_sz, char *log_dir,
                           size_t log_dir_sz, int *log_level, bool *log_stdout) {
@@ -147,6 +148,13 @@ static int load_init_file(const char *path, VirtualPortCfg *vpc,
         }
       }
     }
+  }
+
+  // transport (string): virtual | udp | serial | adin
+  d = toml_get(root, "transport");
+  if (d.type == TOML_STRING) {
+    strncpy(transport_str, d.u.s, transport_str_sz - 1);
+    transport_str[transport_str_sz - 1] = '\0';
   }
 
   // uart-device (string)
@@ -240,6 +248,7 @@ int bm_sbc_runtime_init(int argc, char **argv, const char *app_name) {
           sizeof(vpc.socket_dir) - 1);
   bool node_id_set = false;
   char cfg_dir[512] = {0};
+  char transport_str[16] = {0}; // empty = default (virtual)
   char uart_path[128] = {0};
   char pcap_path[256] = {0};
   int baud_rate = 115200;
@@ -264,6 +273,7 @@ int bm_sbc_runtime_init(int argc, char **argv, const char *app_name) {
   static const struct option long_opts[] = {
       {"init", required_argument, NULL, 'i'},
       {"node-id", required_argument, NULL, 'n'},
+      {"transport", required_argument, NULL, 't'},
       {"cfg-dir", required_argument, NULL, 'c'},
       {"peer", required_argument, NULL, 'p'},
       {"socket-dir", required_argument, NULL, 's'},
@@ -290,6 +300,10 @@ int bm_sbc_runtime_init(int argc, char **argv, const char *app_name) {
         return 1;
       }
       node_id_set = true;
+      break;
+    }
+    case 't': {
+      strncpy(transport_str, optarg, sizeof(transport_str) - 1);
       break;
     }
     case 'c': {
@@ -365,6 +379,8 @@ int bm_sbc_runtime_init(int argc, char **argv, const char *app_name) {
     uint64_t cli_node_id = vpc.own_node_id;
     char cli_cfg_dir[512];
     strncpy(cli_cfg_dir, cfg_dir, sizeof(cli_cfg_dir));
+    char cli_transport_str[sizeof(transport_str)];
+    strncpy(cli_transport_str, transport_str, sizeof(cli_transport_str));
     char cli_socket_dir[sizeof(vpc.socket_dir)];
     strncpy(cli_socket_dir, vpc.socket_dir, sizeof(cli_socket_dir));
     uint8_t cli_num_peers = vpc.num_peers;
@@ -386,6 +402,7 @@ int bm_sbc_runtime_init(int argc, char **argv, const char *app_name) {
             sizeof(vpc.socket_dir) - 1);
     node_id_set = false;
     memset(cfg_dir, 0, sizeof(cfg_dir));
+    memset(transport_str, 0, sizeof(transport_str));
     memset(uart_path, 0, sizeof(uart_path));
     memset(pcap_path, 0, sizeof(pcap_path));
     baud_rate = 115200;
@@ -394,9 +411,11 @@ int bm_sbc_runtime_init(int argc, char **argv, const char *app_name) {
     log_stdout_flag = false;
 
     int rc = load_init_file(init_path, &vpc, &node_id_set, cfg_dir,
-                            sizeof(cfg_dir), uart_path, sizeof(uart_path),
-                            &baud_rate, pcap_path, sizeof(pcap_path), log_dir,
-                            sizeof(log_dir), &log_level, &log_stdout_flag);
+                            sizeof(cfg_dir), transport_str,
+                            sizeof(transport_str), uart_path,
+                            sizeof(uart_path), &baud_rate, pcap_path,
+                            sizeof(pcap_path), log_dir, sizeof(log_dir),
+                            &log_level, &log_stdout_flag);
     if (rc != 0) {
       return rc;
     }
@@ -408,6 +427,9 @@ int bm_sbc_runtime_init(int argc, char **argv, const char *app_name) {
     }
     if (cli_cfg_dir[0] != '\0') {
       strncpy(cfg_dir, cli_cfg_dir, sizeof(cfg_dir) - 1);
+    }
+    if (cli_transport_str[0] != '\0') {
+      strncpy(transport_str, cli_transport_str, sizeof(transport_str) - 1);
     }
     if (strcmp(cli_socket_dir, VIRTUAL_PORT_DEFAULT_SOCKET_DIR) != 0) {
       strncpy(vpc.socket_dir, cli_socket_dir, sizeof(vpc.socket_dir) - 1);
@@ -442,6 +464,15 @@ int bm_sbc_runtime_init(int argc, char **argv, const char *app_name) {
     return 1;
   }
 
+  // --- Transport selection ------------------------------------------------
+  TransportKind transport_kind = TransportVirtual; // default when unset
+  if (transport_str[0] != '\0' &&
+      !transport_kind_parse(transport_str, &transport_kind)) {
+    fprintf(stderr, "bm_sbc: invalid transport value: %s\n", transport_str);
+    fprintf(stderr, "%s", k_usage);
+    return 1;
+  }
+
   // --- Config partition persistence --------------------------------------
   if (cfg_dir[0] != '\0') {
     platform_linux_set_cfg_dir(cfg_dir);
@@ -463,8 +494,9 @@ int bm_sbc_runtime_init(int argc, char **argv, const char *app_name) {
 
   // --- First structured log line ------------------------------------------
   bool gateway_mode = (uart_path[0] != '\0');
-  bm_log_info("node_id=0x%016" PRIx64 " peers=%u socket_dir=%s%s%s",
-              vpc.own_node_id, (unsigned)vpc.num_peers, vpc.socket_dir,
+  bm_log_info("node_id=0x%016" PRIx64 " transport=%s peers=%u socket_dir=%s%s%s",
+              vpc.own_node_id, transport_kind_name(transport_kind),
+              (unsigned)vpc.num_peers, vpc.socket_dir,
               gateway_mode ? " uart=" : "", gateway_mode ? uart_path : "");
 
   // --- device_init --------------------------------------------------------
@@ -488,22 +520,17 @@ int bm_sbc_runtime_init(int argc, char **argv, const char *app_name) {
   dev_cfg.ver_patch = BM_SBC_VERSION_PATCH;
   device_init(dev_cfg);
 
-  // --- VirtualPortDevice setup ------------------------------------------
-  NetworkDevice vpd_dev = virtual_port_device_get(&vpc);
-  NetworkDevice net_dev;
+  // --- NetworkDevice construction (transport factory) --------------------
+  TransportFactoryCfg tf_cfg;
+  memset(&tf_cfg, 0, sizeof(tf_cfg));
+  tf_cfg.kind = transport_kind;
+  tf_cfg.vpc = vpc;
+  tf_cfg.uart_path = uart_path;
+  tf_cfg.baud_rate = baud_rate;
 
-  if (gateway_mode) {
-    // Gateway mode: composite device wrapping VPD + UART.
-    int uart_err = uart_l2_transport_init(uart_path, baud_rate,
-                                          gateway_uart_rx_cb, nullptr);
-    if (uart_err != 0) {
-      bm_log_error("UART transport init failed");
-      return 1;
-    }
-    net_dev = gateway_device_get(&vpd_dev);
-  } else {
-    // Normal mode: VPD only.
-    net_dev = vpd_dev;
+  NetworkDevice net_dev;
+  if (transport_factory_create(&tf_cfg, &net_dev) != 0) {
+    return 1;
   }
 
   // --- Bristlemouth startup sequence ------------------------------------
