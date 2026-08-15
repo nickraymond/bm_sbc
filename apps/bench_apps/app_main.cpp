@@ -15,6 +15,10 @@
 ///                       S3 stream server's ingest (127.0.0.1:8081,
 ///                       "frame" JSON header line + JPEG bytes) --
 ///                       browser demo at http://nereus001:8080/stream.
+///                       Also: operator CLI on stdin (type `help`),
+///                       periodic aggregated uplink via the SHIPPED
+///                       spotter_tx_data() (REV-8), and the shipped
+///                       gateway_ipc listener for the python client.
 ///
 /// Wire contracts replicated from ADIN_SPI_OpenMV
 /// firmware/bm_he/src/camera_svc.h (camera structs; change in lockstep
@@ -23,10 +27,13 @@
 /// the only requester).
 ///
 /// Environment knobs:
-///   S17_ROLE        light | telemetry (required)
-///   S17_LED_PATH    LED sysfs dir (default /sys/class/leds/ACT)
-///   S17_STATE_PATH  light state artifact (default /tmp/s17_light_state)
-///   S17_INGEST      stream-server ingest (default 127.0.0.1:8081)
+///   S17_ROLE           light | telemetry (required)
+///   S17_LED_PATH       LED sysfs dir (default /sys/class/leds/ACT)
+///   S17_STATE_PATH     light state artifact (default /tmp/s17_light_state)
+///   S17_INGEST         stream-server ingest (default 127.0.0.1:8081)
+///   S17_UPLINK_SECS    aggregated-uplink period, 0 = off (default 30)
+///   BM_SBC_GATEWAY_IPC gateway_ipc socket path (shared with the python
+///                      client; use /tmp/... on the bench)
 ///
 /// Output markers (grepped by demo docs): LIGHT_STAT / TEL_STAT once
 /// per second; LIGHT_CMD on every accepted command.
@@ -41,6 +48,7 @@
 #include <ctime>
 #include <deque>
 #include <mutex>
+#include <poll.h>
 #include <string>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -49,11 +57,16 @@
 #include "bm_log.h"
 
 extern "C" {
-#include "device.h" // node_id()
+#include "device.h"        // node_id()
+#include "messages/time.h" // bcmp_time_set_time (BCMP re-tx crosses Light)
+#include "spotter.h"       // spotter_tx_data -- THE shipped uplink (REV-8)
 }
 
 #include "bm_service.h"
+#include "bm_service_request.h"
 #include "chunk_reasm.h"
+#include "gateway_ipc.h"
+#include "power_info_service.h"
 #include "pubsub.h"
 
 // ---------------------------------------------------------------------------
@@ -63,6 +76,41 @@ extern "C" {
 // camera/stream data plane (camera_svc.h): topic + chunk format
 // (chunk_reasm.h holds the header layout).
 static const char *k_camera_topic = "camera/stream";
+
+// camera/control service. REPLICATED from ADIN_SPI_OpenMV
+// firmware/bm_he/src/camera_svc.h -- change in lockstep or not at all.
+#define CAMERA_SERVICE "camera/control"
+#define CAMERA_REQ_MAGIC 0x314D4143u // 'CAM1' little-endian
+#define CAMERA_CMD_CAPTURE 1u
+#define CAMERA_CMD_STREAM 2u
+#define CAMERA_CMD_STATUS 3u
+#define CAMERA_CMD_STOP 4u
+
+struct __attribute__((packed)) camera_req_t {
+  uint32_t magic;
+  uint8_t cmd;
+  uint8_t quality;      // 0 = bridge default (50)
+  uint16_t fps_x10;     // 0 = bridge default (10.0 fps)
+  uint32_t rate_bps;    // 0 = fps-paced only
+  uint16_t secs;        // 0 = bridge default (60)
+  uint16_t payload_max; // 0 = 1400 (REV-28)
+};                      // 16 B
+static_assert(sizeof(camera_req_t) == 16, "camera_req_t ABI (camera_svc.h)");
+
+struct __attribute__((packed)) camera_rep_t {
+  uint32_t magic;
+  uint8_t ok;
+  uint8_t mode_active;
+  uint16_t rsvd;
+  uint32_t cmds;
+  uint32_t pub_ok;
+  uint32_t pub_errs;
+  uint32_t pub_bytes;
+};                      // 24 B
+static_assert(sizeof(camera_rep_t) == 24, "camera_rep_t ABI (camera_svc.h)");
+
+// Fixed bench node ids (pi/bm_bench, Nick 2026-08-14; never reused).
+static const uint64_t k_camera_node = 0xbe9c000000000003ull;
 
 // light/control service. Packed LE structs, same style + rationale as
 // the camera service (cbor helper is config-only; flash-poor HE end).
@@ -425,6 +473,240 @@ static void telemetry_loop(void) {
 }
 
 // ---------------------------------------------------------------------------
+// Telemetry role: operator CLI + uplink (C2)
+// ---------------------------------------------------------------------------
+
+static uint64_t s_uplink_secs = 30; // 0 disables the periodic uplink
+static uint64_t s_uplink_next_ms = 0;
+static uint64_t s_uplink_sent = 0;
+static bool s_ipc_up = false;
+
+// Service replies (any thread) -> printed markers the demo greps.
+static bool camera_reply_cb(bool ack, uint32_t msg_id, size_t /*slen*/,
+                            const char * /*service*/, size_t reply_len,
+                            uint8_t *reply_data) {
+  if (!ack) {
+    printf("CAM_REPLY id=%" PRIu32 " TIMEOUT\n", msg_id);
+    fflush(stdout);
+    return true;
+  }
+  camera_rep_t rep;
+  if (reply_len != sizeof(rep)) {
+    printf("CAM_REPLY id=%" PRIu32 " BAD_LEN %zu\n", msg_id, reply_len);
+    fflush(stdout);
+    return false;
+  }
+  memcpy(&rep, reply_data, sizeof(rep));
+  printf("CAM_REPLY id=%" PRIu32 " ok=%u mode=%u cmds=%" PRIu32
+         " pub_ok=%" PRIu32 " pub_errs=%" PRIu32 " pub_bytes=%" PRIu32 "\n",
+         msg_id, rep.ok, rep.mode_active, rep.cmds, rep.pub_ok, rep.pub_errs,
+         rep.pub_bytes);
+  fflush(stdout);
+  return true;
+}
+
+static bool light_reply_cb(bool ack, uint32_t msg_id, size_t /*slen*/,
+                           const char * /*service*/, size_t reply_len,
+                           uint8_t *reply_data) {
+  if (!ack) {
+    printf("LIGHT_REPLY id=%" PRIu32 " TIMEOUT\n", msg_id);
+    fflush(stdout);
+    return true;
+  }
+  light_rep_t rep;
+  if (reply_len != sizeof(rep)) {
+    printf("LIGHT_REPLY id=%" PRIu32 " BAD_LEN %zu\n", msg_id, reply_len);
+    fflush(stdout);
+    return false;
+  }
+  memcpy(&rep, reply_data, sizeof(rep));
+  printf("LIGHT_REPLY id=%" PRIu32 " ok=%u level=%u strobing=%u cmds=%" PRIu32
+         " uptime=%" PRIu32 "s\n",
+         msg_id, rep.ok, rep.level, rep.strobing, rep.cmds, rep.uptime_s);
+  fflush(stdout);
+  return true;
+}
+
+static BmErr power_reply_cb(const PowerInfoReplyData *d) {
+  printf("POWER_REPLY total_on=%" PRIu32 "s remaining_on=%" PRIu32
+         "s upcoming_off=%" PRIu32 "s\n",
+         d->total_on_s, d->remaining_on_s, d->upcoming_off_s);
+  fflush(stdout);
+  return BmOK;
+}
+
+static void send_camera_req(uint8_t cmd, uint8_t q, uint16_t fps_x10,
+                            uint32_t rate_bps, uint16_t secs) {
+  camera_req_t req;
+  memset(&req, 0, sizeof(req));
+  req.magic = CAMERA_REQ_MAGIC;
+  req.cmd = cmd;
+  req.quality = q;
+  req.fps_x10 = fps_x10;
+  req.rate_bps = rate_bps;
+  req.secs = secs;
+  if (!bm_service_request(strlen(CAMERA_SERVICE), CAMERA_SERVICE, sizeof(req),
+                          (const uint8_t *)&req, camera_reply_cb, 6)) {
+    printf("CAM_REPLY REQUEST_FAILED\n");
+    fflush(stdout);
+  }
+}
+
+static void send_light_req(uint8_t cmd, uint8_t level, uint16_t on_ms,
+                           uint16_t off_ms, uint16_t count) {
+  light_req_t req;
+  memset(&req, 0, sizeof(req));
+  req.magic = LIGHT_REQ_MAGIC;
+  req.cmd = cmd;
+  req.level = level;
+  req.on_ms = on_ms;
+  req.off_ms = off_ms;
+  req.count = count;
+  if (!bm_service_request(strlen(LIGHT_SERVICE), LIGHT_SERVICE, sizeof(req),
+                          (const uint8_t *)&req, light_reply_cb, 6)) {
+    printf("LIGHT_REPLY REQUEST_FAILED\n");
+    fflush(stdout);
+  }
+}
+
+static void time_sync_camera(void) {
+  struct timespec rt;
+  clock_gettime(CLOCK_REALTIME, &rt);
+  uint64_t utc_us =
+      (uint64_t)rt.tv_sec * 1000000ull + (uint64_t)rt.tv_nsec / 1000ull;
+  BmErr err = bcmp_time_set_time(k_camera_node, utc_us);
+  printf("TIME_SYNC target=%016" PRIx64 " utc_us=%" PRIu64 " err=%d "
+         "(camera inherits this node's clock; response logs at debug)\n",
+         k_camera_node, utc_us, (int)err);
+  fflush(stdout);
+}
+
+static void cli_help(void) {
+  printf("commands:\n"
+         "  capture [q]                 trigger one frame (JPEG q, 0=default)\n"
+         "  stream <mbps> <fps> <secs>  start the camera stream\n"
+         "  stop                        stop the camera stream\n"
+         "  cam-status                  camera service counters\n"
+         "  light <level>               set light level 0..100\n"
+         "  strobe <on_ms> <off_ms> <n> strobe the light\n"
+         "  light-status                light state query\n"
+         "  power                       power service query (2-hop, AE3 sim)\n"
+         "  time-sync                   push this host's UTC to the camera\n"
+         "  status                      local telemetry ledger\n");
+  fflush(stdout);
+}
+
+static void cli_handle(char *line) {
+  char *cmd = strtok(line, " \t");
+  if (!cmd) {
+    return;
+  }
+  if (strcmp(cmd, "capture") == 0) {
+    const char *q = strtok(nullptr, " \t");
+    send_camera_req(CAMERA_CMD_CAPTURE, q ? (uint8_t)atoi(q) : 0, 0, 0, 0);
+  } else if (strcmp(cmd, "stream") == 0) {
+    const char *mbps = strtok(nullptr, " \t");
+    const char *fps = strtok(nullptr, " \t");
+    const char *secs = strtok(nullptr, " \t");
+    send_camera_req(CAMERA_CMD_STREAM, 0,
+                    fps ? (uint16_t)(atof(fps) * 10) : 0,
+                    mbps ? (uint32_t)(atof(mbps) * 1e6) : 0,
+                    secs ? (uint16_t)atoi(secs) : 0);
+  } else if (strcmp(cmd, "stop") == 0) {
+    send_camera_req(CAMERA_CMD_STOP, 0, 0, 0, 0);
+  } else if (strcmp(cmd, "cam-status") == 0) {
+    send_camera_req(CAMERA_CMD_STATUS, 0, 0, 0, 0);
+  } else if (strcmp(cmd, "light") == 0) {
+    const char *lvl = strtok(nullptr, " \t");
+    send_light_req(LIGHT_CMD_LEVEL, lvl ? (uint8_t)atoi(lvl) : 0, 0, 0, 0);
+  } else if (strcmp(cmd, "strobe") == 0) {
+    const char *on = strtok(nullptr, " \t");
+    const char *off = strtok(nullptr, " \t");
+    const char *n = strtok(nullptr, " \t");
+    send_light_req(LIGHT_CMD_STROBE, 0, on ? (uint16_t)atoi(on) : 200,
+                   off ? (uint16_t)atoi(off) : 200,
+                   n ? (uint16_t)atoi(n) : 5);
+  } else if (strcmp(cmd, "light-status") == 0) {
+    send_light_req(LIGHT_CMD_QUERY, 0, 0, 0, 0);
+  } else if (strcmp(cmd, "power") == 0) {
+    if (power_info_service_request(power_reply_cb, 6) != BmOK) {
+      printf("POWER_REPLY REQUEST_FAILED\n");
+      fflush(stdout);
+    }
+  } else if (strcmp(cmd, "time-sync") == 0) {
+    time_sync_camera();
+  } else if (strcmp(cmd, "status") == 0) {
+    printf("TEL_LEDGER frames_ok=%" PRIu32 " dropped=%" PRIu32
+           " gaps=%" PRIu32 " hdr_errs=%" PRIu32 " q_drops=%" PRIu64
+           " ingest_ok=%" PRIu64 " ingest_fail=%" PRIu64 " uplinks=%" PRIu64
+           " ipc=%s\n",
+           s_reasm.frames_ok, s_reasm.frames_dropped, s_reasm.chunk_gaps,
+           s_reasm.hdr_errors, s_q_drops, s_ingest_frames, s_ingest_fails,
+           s_uplink_sent, s_ipc_up ? "up" : "down");
+    fflush(stdout);
+  } else {
+    cli_help();
+  }
+}
+
+static void cli_poll(void) {
+  static char buf[256];
+  static size_t fill = 0;
+  struct pollfd pfd = {0, POLLIN, 0};
+  while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+    char c;
+    ssize_t r = read(0, &c, 1);
+    if (r <= 0) {
+      return; // EOF (piped stdin): stop polling this pass
+    }
+    if (c == '\n') {
+      buf[fill] = '\0';
+      fill = 0;
+      cli_handle(buf);
+    } else if (fill < sizeof(buf) - 1) {
+      buf[fill++] = c;
+    }
+  }
+}
+
+// Periodic uplink: aggregate the ledger and hand it to the SHIPPED
+// uplink primitive, spotter_tx_data() -> "spotter/transmit-data" on
+// pub/sub (in production the mote subscribes and does satellite TX; on
+// the bench the publish itself -- pcap + this log line -- is the
+// artifact, stated honestly). Option A per the approved plan.
+static void uplink_tick(void) {
+  if (s_uplink_secs == 0) {
+    return;
+  }
+  uint64_t ms = now_ms();
+  if (s_uplink_next_ms == 0) {
+    s_uplink_next_ms = ms + s_uplink_secs * 1000;
+    return;
+  }
+  if (ms < s_uplink_next_ms) {
+    return;
+  }
+  s_uplink_next_ms = ms + s_uplink_secs * 1000;
+  char report[256];
+  int n = snprintf(report, sizeof(report),
+                   "{\"src\": \"%016" PRIx64 "\", \"t\": %.0f, "
+                   "\"frames_ok\": %" PRIu32 ", \"frames_dropped\": %" PRIu32
+                   ", \"chunk_gaps\": %" PRIu32 ", \"ingest_ok\": %" PRIu64
+                   ", \"uplink_seq\": %" PRIu64 "}",
+                   node_id(), now_sec(), s_reasm.frames_ok,
+                   s_reasm.frames_dropped, s_reasm.chunk_gaps,
+                   s_ingest_frames, s_uplink_sent);
+  BmErr err = spotter_tx_data(report, (uint16_t)n, BmNetworkTypeCellularOnly);
+  if (err == BmOK) {
+    s_uplink_sent++;
+    printf("UPLINK_TX %d B seq=%" PRIu64 " %s\n", n, s_uplink_sent, report);
+  } else {
+    printf("UPLINK_TX FAILED err=%d\n", (int)err);
+  }
+  fflush(stdout);
+}
+
+// ---------------------------------------------------------------------------
 // App contract
 // ---------------------------------------------------------------------------
 
@@ -470,10 +752,25 @@ void setup(void) {
       bm_log_error("telemetry: bm_sub(%s) failed", k_camera_topic);
       exit(1);
     }
+    const char *up = getenv("S17_UPLINK_SECS");
+    if (up) {
+      s_uplink_secs = (uint64_t)atoi(up);
+    }
+    // The shipped external-process door (REV-8). Socket path override:
+    // BM_SBC_GATEWAY_IPC (both here and in the python client) -- the
+    // bench uses /tmp to avoid /run permissions. Failure is non-fatal:
+    // the door is an extra, the BM side keeps running.
+    s_ipc_up = gateway_ipc_init(node_id()) == 0;
+    if (!s_ipc_up) {
+      bm_log_warn("telemetry: gateway_ipc_init failed -- python-client "
+                  "demo unavailable (set BM_SBC_GATEWAY_IPC to a writable "
+                  "path)");
+    }
     bm_log_info("telemetry: node %016" PRIx64 " subscribed to %s, "
-                "ingest -> %s:%d",
+                "ingest -> %s:%d, uplink every %" PRIu64 "s, ipc=%s",
                 node_id(), k_camera_topic, s_ingest_host.c_str(),
-                s_ingest_port);
+                s_ingest_port, s_uplink_secs, s_ipc_up ? "up" : "down");
+    cli_help();
   }
 }
 
@@ -482,5 +779,10 @@ void loop(void) {
     light_loop();
   } else {
     telemetry_loop();
+    if (s_ipc_up) {
+      gateway_ipc_poll();
+    }
+    cli_poll();
+    uplink_tick();
   }
 }
