@@ -241,3 +241,11 @@ target_include_directories(test_udp_port_util PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src/net
 )
 add_test(NAME udp_port_util COMMAND test_udp_port_util)
+
+add_executable(test_chunk_reasm
+  tests/test_chunk_reasm.c
+)
+target_include_directories(test_chunk_reasm PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/apps/bench_apps
+)
+add_test(NAME chunk_reasm COMMAND test_chunk_reasm)
