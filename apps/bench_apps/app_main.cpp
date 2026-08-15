@@ -42,6 +42,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cinttypes>
+#include <cstddef> // offsetof (camera_rep_t ABI lock)
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -50,6 +51,7 @@
 #include <mutex>
 #include <poll.h>
 #include <string>
+#include <strings.h> // strcasecmp (res/pf CLI args)
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
@@ -86,6 +88,17 @@ static const char *k_camera_topic = "camera/stream";
 #define CAMERA_CMD_STATUS 3u
 #define CAMERA_CMD_STOP 4u
 
+// S18 capture geometry. The AE3 sensor letterboxes to 16:10 (QVGA is
+// 320x200) and rejects QQVGA/SVGA/WXGA; nothing above HD is offered.
+// Out-of-range values are REFUSED by the service (ok = 0), not clamped.
+#define CAMERA_RES_DEFAULT 0u
+#define CAMERA_RES_QVGA 1u // 320x200
+#define CAMERA_RES_VGA 2u  // 640x400
+#define CAMERA_RES_HD 3u   // 1280x800
+#define CAMERA_PF_DEFAULT 0u
+#define CAMERA_PF_COLOR 1u
+#define CAMERA_PF_MONO 2u
+
 struct __attribute__((packed)) camera_req_t {
   uint32_t magic;
   uint8_t cmd;
@@ -94,20 +107,24 @@ struct __attribute__((packed)) camera_req_t {
   uint32_t rate_bps;    // 0 = fps-paced only
   uint16_t secs;        // 0 = bridge default (60)
   uint16_t payload_max; // 0 = 1400 (REV-28)
-};                      // 16 B
-static_assert(sizeof(camera_req_t) == 16, "camera_req_t ABI (camera_svc.h)");
+  uint8_t resolution;   // CAMERA_RES_*, 0 = bridge default (S18)
+  uint8_t pixformat;    // CAMERA_PF_*,  0 = bridge default (S18)
+};                      // 18 B
+static_assert(sizeof(camera_req_t) == 18, "camera_req_t ABI (camera_svc.h)");
 
 struct __attribute__((packed)) camera_rep_t {
   uint32_t magic;
   uint8_t ok;
   uint8_t mode_active;
-  uint16_t rsvd;
+  uint8_t res_active; // last COMMANDED, not confirmed by the sensor
+  uint8_t pf_active;
   uint32_t cmds;
   uint32_t pub_ok;
   uint32_t pub_errs;
   uint32_t pub_bytes;
-};                      // 24 B
+};                      // 24 B (S18 reused the old rsvd u16)
 static_assert(sizeof(camera_rep_t) == 24, "camera_rep_t ABI (camera_svc.h)");
+static_assert(offsetof(camera_rep_t, cmds) == 8, "camera_rep_t cmds @ 8");
 
 // Fixed bench node ids (pi/bm_bench, Nick 2026-08-14; never reused).
 static const uint64_t k_camera_node = 0xbe9c000000000003ull;
@@ -497,10 +514,18 @@ static bool camera_reply_cb(bool ack, uint32_t msg_id, size_t /*slen*/,
     return false;
   }
   memcpy(&rep, reply_data, sizeof(rep));
-  printf("CAM_REPLY id=%" PRIu32 " ok=%u mode=%u cmds=%" PRIu32
+  static const char *res_name[] = {"default", "qvga", "vga", "hd"};
+  static const char *pf_name[] = {"default", "color", "mono"};
+  printf("CAM_REPLY id=%" PRIu32 " ok=%u mode=%u res=%s pf=%s cmds=%" PRIu32
          " pub_ok=%" PRIu32 " pub_errs=%" PRIu32 " pub_bytes=%" PRIu32 "\n",
-         msg_id, rep.ok, rep.mode_active, rep.cmds, rep.pub_ok, rep.pub_errs,
-         rep.pub_bytes);
+         msg_id, rep.ok, rep.mode_active,
+         rep.res_active < 4 ? res_name[rep.res_active] : "?",
+         rep.pf_active < 3 ? pf_name[rep.pf_active] : "?", rep.cmds,
+         rep.pub_ok, rep.pub_errs, rep.pub_bytes);
+  if (!rep.ok) {
+    printf("CAM_REPLY REFUSED — check res/pf spelling "
+           "(res = qvga|vga|hd, pf = color|mono)\n");
+  }
   fflush(stdout);
   return true;
 }
@@ -535,8 +560,30 @@ static BmErr power_reply_cb(const PowerInfoReplyData *d) {
   return BmOK;
 }
 
+// Accepts "qvga"/"vga"/"hd" and "color"/"mono" (also "grey"/"gray"); an
+// empty arg means 0 = bridge default. Anything else is passed through as
+// an out-of-range value so the SERVICE refuses it and says so, rather
+// than this CLI quietly picking something the operator didn't ask for.
+static uint8_t parse_res(const char *s) {
+  if (!s) return CAMERA_RES_DEFAULT;
+  if (!strcasecmp(s, "qvga")) return CAMERA_RES_QVGA;
+  if (!strcasecmp(s, "vga")) return CAMERA_RES_VGA;
+  if (!strcasecmp(s, "hd")) return CAMERA_RES_HD;
+  return 0xFF;
+}
+static uint8_t parse_pf(const char *s) {
+  if (!s) return CAMERA_PF_DEFAULT;
+  if (!strcasecmp(s, "color") || !strcasecmp(s, "colour"))
+    return CAMERA_PF_COLOR;
+  if (!strcasecmp(s, "mono") || !strcasecmp(s, "grey") ||
+      !strcasecmp(s, "gray"))
+    return CAMERA_PF_MONO;
+  return 0xFF;
+}
+
 static void send_camera_req(uint8_t cmd, uint8_t q, uint16_t fps_x10,
-                            uint32_t rate_bps, uint16_t secs) {
+                            uint32_t rate_bps, uint16_t secs, uint8_t res,
+                            uint8_t pf) {
   camera_req_t req;
   memset(&req, 0, sizeof(req));
   req.magic = CAMERA_REQ_MAGIC;
@@ -545,6 +592,8 @@ static void send_camera_req(uint8_t cmd, uint8_t q, uint16_t fps_x10,
   req.fps_x10 = fps_x10;
   req.rate_bps = rate_bps;
   req.secs = secs;
+  req.resolution = res;
+  req.pixformat = pf;
   if (!bm_service_request(strlen(CAMERA_SERVICE), CAMERA_SERVICE, sizeof(req),
                           (const uint8_t *)&req, camera_reply_cb, 6)) {
     printf("CAM_REPLY REQUEST_FAILED\n");
@@ -583,8 +632,11 @@ static void time_sync_camera(void) {
 
 static void cli_help(void) {
   printf("commands:\n"
-         "  capture [q]                 trigger one frame (JPEG q, 0=default)\n"
-         "  stream <mbps> <fps> <secs>  start the camera stream\n"
+         "  capture [q] [res] [pf]      trigger one frame\n"
+         "  stream <mbps> <fps> <secs> [q] [res] [pf]\n"
+         "                              start the camera stream\n"
+         "      res = qvga|vga|hd (320x200 / 640x400 / 1280x800, 16:10)\n"
+         "      pf  = color|mono          omit either for the default\n"
          "  stop                        stop the camera stream\n"
          "  cam-status                  camera service counters\n"
          "  light <level>               set light level 0..100\n"
@@ -603,19 +655,26 @@ static void cli_handle(char *line) {
   }
   if (strcmp(cmd, "capture") == 0) {
     const char *q = strtok(nullptr, " \t");
-    send_camera_req(CAMERA_CMD_CAPTURE, q ? (uint8_t)atoi(q) : 0, 0, 0, 0);
+    const char *res = strtok(nullptr, " \t");
+    const char *pf = strtok(nullptr, " \t");
+    send_camera_req(CAMERA_CMD_CAPTURE, q ? (uint8_t)atoi(q) : 0, 0, 0, 0,
+                    parse_res(res), parse_pf(pf));
   } else if (strcmp(cmd, "stream") == 0) {
     const char *mbps = strtok(nullptr, " \t");
     const char *fps = strtok(nullptr, " \t");
     const char *secs = strtok(nullptr, " \t");
-    send_camera_req(CAMERA_CMD_STREAM, 0,
+    const char *q = strtok(nullptr, " \t");
+    const char *res = strtok(nullptr, " \t");
+    const char *pf = strtok(nullptr, " \t");
+    send_camera_req(CAMERA_CMD_STREAM, q ? (uint8_t)atoi(q) : 0,
                     fps ? (uint16_t)(atof(fps) * 10) : 0,
                     mbps ? (uint32_t)(atof(mbps) * 1e6) : 0,
-                    secs ? (uint16_t)atoi(secs) : 0);
+                    secs ? (uint16_t)atoi(secs) : 0, parse_res(res),
+                    parse_pf(pf));
   } else if (strcmp(cmd, "stop") == 0) {
-    send_camera_req(CAMERA_CMD_STOP, 0, 0, 0, 0);
+    send_camera_req(CAMERA_CMD_STOP, 0, 0, 0, 0, 0, 0);
   } else if (strcmp(cmd, "cam-status") == 0) {
-    send_camera_req(CAMERA_CMD_STATUS, 0, 0, 0, 0);
+    send_camera_req(CAMERA_CMD_STATUS, 0, 0, 0, 0, 0, 0);
   } else if (strcmp(cmd, "light") == 0) {
     const char *lvl = strtok(nullptr, " \t");
     send_light_req(LIGHT_CMD_LEVEL, lvl ? (uint8_t)atoi(lvl) : 0, 0, 0, 0);
