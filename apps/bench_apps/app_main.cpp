@@ -54,7 +54,8 @@
 #include <poll.h>
 #include <string>
 #include <strings.h>  // strcasecmp (res/pf CLI args)
-#include <sys/stat.h> // chmod (control socket)
+#include <sys/stat.h>    // chmod (control socket), mkdir (capture dir)
+#include <sys/statvfs.h> // free-space floor before a still is written
 #include <sys/socket.h>
 #include <sys/un.h> // AF_UNIX control socket
 #include <unistd.h>
@@ -192,6 +193,34 @@ static double now_sec(void) {
 }
 
 static uint64_t now_ms(void) { return (uint64_t)(now_sec() * 1000.0); }
+
+// --- what was commanded, and what came back (S18 bite B) -------------------
+//
+// Service replies arrive on middleware threads; the control socket and the
+// still-save are served from loop(). One mutex covers the handful of scalars
+// both touch. Nothing here changes the BM path -- it only remembers what
+// already went past, so the web tool can ask "what did I command, and what
+// did the chain answer?" without scraping the journal.
+static std::mutex s_ctl_lock;
+static struct {
+  bool params_seen;
+  char last_cmd[BENCH_CTL_VERB_MAX];
+  double last_cmd_t;
+  int quality;
+  uint8_t res, pf;
+  double fps, mbps;
+  int secs;
+
+  bool cam_seen;
+  double cam_t;
+  const char *cam_state; // ok | timeout | bad_len
+  camera_rep_t cam;
+
+  bool light_seen;
+  double light_t;
+  const char *light_state;
+  light_rep_t light;
+} s_ctl;
 
 // ---------------------------------------------------------------------------
 // Light role: HAL (sysfs LED + state-file artifact)
@@ -471,6 +500,224 @@ static void ingest_frame(uint32_t seq, const uint8_t *jpeg, size_t n) {
   s_ingest_frames++;
 }
 
+// ---------------------------------------------------------------------------
+// Telemetry role: still-save with JSON sidecars (S18 bite B)
+// ---------------------------------------------------------------------------
+//
+// An accepted `capture` arms a one-shot save; the next completed frame is
+// written to S18_CAPTURE_DIR with a sidecar recording every parameter and
+// the measured stats AT CAPTURE TIME. Stream frames are never saved.
+//
+// Arming happens inside send_camera_req, so it covers the FIFO CLI and the
+// control socket identically -- a still taken by hand is saved exactly like
+// one taken from the web tool.
+//
+// Files land via a .tmp + rename(), and the JPEG lands BEFORE the sidecar:
+// the sidecar is the COMMIT RECORD, so a sidecar can never point at a JPEG
+// that is missing or half-written. Bite C's gallery enumerates sidecars.
+//
+// Nothing here deletes anything, ever. Below a free-space floor the save is
+// refused and counted -- bench captures are evidence, and an instrument that
+// silently destroys its own measurements is worse than one that stops.
+//
+// All of this runs on the app thread (telemetry_loop, cli_poll and ctl_poll
+// are all called from loop()), so the state below needs no lock.
+
+#define SAVE_WINDOW_MS 8000u  // how long a capture waits for its frame
+#define SAVE_MIN_FREE_MB 200u // refuse below this; never delete
+
+static std::string s_save_dir;            // empty = saving disabled
+static const char *s_save_state = "idle"; // idle|armed|saved|timeout|error
+static bool s_save_armed = false;
+static uint64_t s_save_deadline_ms = 0;
+static const char *s_save_source = "cli";
+static uint8_t s_save_q = 0, s_save_res = 0, s_save_pf = 0;
+static uint32_t s_save_arm_dropped = 0, s_save_arm_gaps = 0;
+static char s_save_last[BENCH_CTL_NAME_MAX] = "";
+static uint32_t s_save_last_bytes = 0;
+static uint64_t s_saves = 0, s_save_errors = 0;
+
+// Context for the NEXT camera command, set by whichever front end is about
+// to issue it and consumed by send_camera_req. The FIFO CLI never sets it,
+// so it sits at these defaults for hand-typed commands.
+static const char *s_cmd_source = "cli";
+static bool s_cmd_save = true;
+
+static void save_dir_init(void) {
+  const char *env = getenv("S18_CAPTURE_DIR");
+  std::string dir;
+  if (env && env[0]) {
+    dir = env;
+  } else {
+    const char *home = getenv("HOME");
+    dir = std::string((home && home[0]) ? home : "/home/pi") + "/bench_captures";
+  }
+  if (mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) {
+    bm_log_warn("save: mkdir(%s) failed (%s) -- stills will NOT be saved",
+                dir.c_str(), strerror(errno));
+    return;
+  }
+  s_save_dir = dir;
+  bm_log_info("save: stills -> %s (the .json sidecar is the commit record)",
+              s_save_dir.c_str());
+}
+
+static uint64_t save_free_mb(void) {
+  struct statvfs vfs;
+  if (s_save_dir.empty() || statvfs(s_save_dir.c_str(), &vfs) != 0) {
+    return 0;
+  }
+  return (uint64_t)vfs.f_bavail * (uint64_t)vfs.f_frsize / (1024ull * 1024ull);
+}
+
+static void save_arm(uint8_t q, uint8_t res, uint8_t pf) {
+  if (s_save_dir.empty()) {
+    return; // saving disabled at startup; already logged there
+  }
+  if (!s_cmd_save) {
+    bm_log_info("save: capture requested with save=false -- not saving");
+    return;
+  }
+  s_save_armed = true;
+  s_save_state = "armed";
+  s_save_deadline_ms = now_ms() + SAVE_WINDOW_MS;
+  s_save_source = s_cmd_source;
+  s_save_q = q; // 0 means "bridge default" -- recorded as commanded, not guessed
+  s_save_res = res;
+  s_save_pf = pf;
+  // Ledger at arm time: the sidecar reports what moved DURING this capture,
+  // which is the only way to answer "did this still lose anything?".
+  s_save_arm_dropped = s_reasm.frames_dropped;
+  s_save_arm_gaps = s_reasm.chunk_gaps;
+}
+
+static bool save_write_file(const std::string &path, const void *data,
+                            size_t n) {
+  std::string tmp = path + ".tmp";
+  FILE *f = fopen(tmp.c_str(), "wb");
+  if (!f) {
+    return false;
+  }
+  bool ok = (n == 0) || (fwrite(data, 1, n, f) == n);
+  if (fclose(f) != 0) {
+    ok = false;
+  }
+  if (ok && rename(tmp.c_str(), path.c_str()) != 0) {
+    ok = false;
+  }
+  if (!ok) {
+    unlink(tmp.c_str());
+  }
+  return ok;
+}
+
+static void save_fail(const char *why, const char *detail) {
+  s_save_errors++;
+  s_save_state = "error";
+  bm_log_warn("save: %s (%s)", why, detail);
+  printf("CAP_SAVE ERROR %s (%s)\n", why, detail);
+  fflush(stdout);
+}
+
+static void save_frame(uint32_t seq, const uint8_t *jpeg, size_t n,
+                       uint16_t chunks) {
+  if (!s_save_armed) {
+    return;
+  }
+  s_save_armed = false;
+
+  uint64_t free_mb = save_free_mb();
+  if (free_mb < SAVE_MIN_FREE_MB) {
+    char d[96];
+    snprintf(d, sizeof(d), "%llu MB free, floor is %u MB",
+             (unsigned long long)free_mb, (unsigned)SAVE_MIN_FREE_MB);
+    save_fail("refusing to save, disk nearly full", d);
+    return;
+  }
+
+  char stamp[BENCH_CTL_STAMP_MAX];
+  char jpg_name[BENCH_CTL_NAME_MAX];
+  char side_name[BENCH_CTL_NAME_MAX];
+  time_t when = time(NULL);
+  if (!bench_ctl_stamp(when, stamp, sizeof(stamp)) ||
+      !bench_ctl_capture_name(stamp, seq, "jpg", jpg_name, sizeof(jpg_name)) ||
+      !bench_ctl_capture_name(stamp, seq, "json", side_name,
+                              sizeof(side_name))) {
+    save_fail("could not build a capture filename", stamp);
+    return;
+  }
+
+  std::string jpg_path = s_save_dir + "/" + jpg_name;
+  if (!save_write_file(jpg_path, jpeg, n)) {
+    save_fail("JPEG write failed", strerror(errno));
+    return;
+  }
+
+  bench_ctl_sidecar_t sc;
+  memset(&sc, 0, sizeof(sc));
+  sc.file = jpg_name;
+  sc.utc = stamp;
+  sc.t = now_sec();
+  sc.frame_seq = seq;
+  sc.bytes = (uint32_t)n;
+  sc.chunks = chunks;
+  sc.source = s_save_source;
+  sc.quality = s_save_q;
+  sc.res = res_name_of(s_save_res);
+  sc.pf = pf_name_of(s_save_pf);
+  {
+    std::lock_guard<std::mutex> g(s_ctl_lock);
+    sc.reply_seen = (s_ctl.cam_seen && strcmp(s_ctl.cam_state, "ok") == 0) ? 1 : 0;
+    sc.reply_ok = s_ctl.cam.ok;
+    sc.reply_res = res_name_of(s_ctl.cam.res_active);
+    sc.reply_pf = pf_name_of(s_ctl.cam.pf_active);
+    sc.pub_ok = s_ctl.cam.pub_ok;
+    sc.pub_errs = s_ctl.cam.pub_errs;
+    sc.pub_bytes = s_ctl.cam.pub_bytes;
+  }
+  sc.frames_ok = s_reasm.frames_ok;
+  sc.frames_dropped = s_reasm.frames_dropped;
+  sc.chunk_gaps = s_reasm.chunk_gaps;
+  sc.hdr_errors = s_reasm.hdr_errors;
+  sc.dropped_delta = s_reasm.frames_dropped - s_save_arm_dropped;
+  sc.gaps_delta = s_reasm.chunk_gaps - s_save_arm_gaps;
+  sc.node = node_id();
+  sc.camera_node = k_camera_node;
+
+  static char side[BENCH_CTL_REPLY_MAX];
+  int sn = bench_ctl_render_sidecar(&sc, side, sizeof(side));
+  if (sn <= 0 || !save_write_file(s_save_dir + "/" + side_name, side,
+                                  (size_t)sn)) {
+    // The JPEG stays where it is: an orphan is invisible to a
+    // sidecar-driven gallery, and deleting a capture to tidy up would
+    // destroy the very thing this tool exists to collect.
+    save_fail("sidecar write failed (JPEG kept, orphaned)", side_name);
+    return;
+  }
+
+  s_saves++;
+  s_save_state = "saved";
+  s_save_last_bytes = (uint32_t)n;
+  snprintf(s_save_last, sizeof(s_save_last), "%s", jpg_name);
+  printf("CAP_SAVED file=%s bytes=%zu seq=%" PRIu32 " chunks=%u res=%s pf=%s "
+         "q=%u src=%s gaps_delta=%" PRIu32 "\n",
+         jpg_name, n, seq, (unsigned)chunks, sc.res, sc.pf, (unsigned)sc.quality,
+         sc.source, sc.gaps_delta);
+  fflush(stdout);
+}
+
+// A capture whose frame never arrives must say so. Silence would read as a
+// still that saved fine.
+static void save_tick(void) {
+  if (s_save_armed && now_ms() > s_save_deadline_ms) {
+    s_save_armed = false;
+    s_save_state = "timeout";
+    printf("CAP_SAVE TIMEOUT no frame within %u ms of the capture command\n",
+           (unsigned)SAVE_WINDOW_MS);
+    fflush(stdout);
+  }
+}
+
 static void telemetry_loop(void) {
   for (;;) {
     std::vector<uint8_t> chunk;
@@ -488,8 +735,12 @@ static void telemetry_loop(void) {
       s_frames_win++;
       s_bytes_win += done;
       ingest_frame(seq, s_jpeg_buf, done);
+      // After the ingest: the browser stream is the frozen S3 path and gets
+      // the frame first; a still is a copy, not a detour.
+      save_frame(seq, s_jpeg_buf, done, s_reasm.count);
     }
   }
+  save_tick();
 
   uint64_t ms = now_ms();
   if (ms - s_last_stat_ms >= 1000) {
@@ -520,33 +771,6 @@ static uint64_t s_uplink_next_ms = 0;
 static uint64_t s_uplink_sent = 0;
 static bool s_ipc_up = false;
 
-// --- what was commanded, and what came back (S18 bite B) -------------------
-//
-// Service replies arrive on middleware threads; the control socket is served
-// from loop(). One mutex covers the handful of scalars both touch. Nothing
-// here changes the BM path -- it only remembers what already went past, so
-// the web tool can ask "what did I command, and what did the chain answer?"
-// without scraping the journal.
-static std::mutex s_ctl_lock;
-static struct {
-  bool params_seen;
-  char last_cmd[BENCH_CTL_VERB_MAX];
-  double last_cmd_t;
-  int quality;
-  uint8_t res, pf;
-  double fps, mbps;
-  int secs;
-
-  bool cam_seen;
-  double cam_t;
-  const char *cam_state; // ok | timeout | bad_len
-  camera_rep_t cam;
-
-  bool light_seen;
-  double light_t;
-  const char *light_state;
-  light_rep_t light;
-} s_ctl;
 
 // Service replies (any thread) -> printed markers the demo greps.
 // Remember a reply for the control socket. `state` is a literal, so the
@@ -685,6 +909,11 @@ static void send_camera_req(uint8_t cmd, uint8_t q, uint16_t fps_x10,
                             uint32_t rate_bps, uint16_t secs, uint8_t res,
                             uint8_t pf) {
   ctl_note_cmd(cmd, q, fps_x10, rate_bps, secs, res, pf);
+  if (cmd == CAMERA_CMD_CAPTURE) {
+    save_arm(q, res, pf);
+  }
+  s_cmd_source = "cli"; // the context is per-command, never sticky
+  s_cmd_save = true;
   camera_req_t req;
   memset(&req, 0, sizeof(req));
   req.magic = CAMERA_REQ_MAGIC;
@@ -977,6 +1206,12 @@ static void ctl_dispatch(const char *msg, size_t len,
   const uint8_t res = r.res[0] ? parse_res(r.res) : CAMERA_RES_DEFAULT;
   const uint8_t pf = r.pf[0] ? parse_pf(r.pf) : CAMERA_PF_DEFAULT;
 
+  // Context for the command this request is about to issue. Default is to
+  // save: a still you forgot to flag is a still you lost, and this tool
+  // exists to collect them. "save": false opts out explicitly.
+  s_cmd_source = "socket";
+  s_cmd_save = (r.save != 0);
+
   if (strcmp(r.verb, "capture") == 0) {
     send_camera_req(CAMERA_CMD_CAPTURE, q, 0, 0, 0, res, pf);
   } else if (strcmp(r.verb, "stream") == 0) {
@@ -1051,6 +1286,13 @@ static void ctl_dispatch(const char *msg, size_t len,
     st.fps_win = s_fps_win;
     st.kbps_win = s_kbps_win;
     st.ipc_up = s_ipc_up ? 1 : 0;
+    st.save_state = s_save_state;
+    st.save_file = s_save_last;
+    st.save_bytes = s_save_last_bytes;
+    st.saves = s_saves;
+    st.save_errors = s_save_errors;
+    st.disk_free_mb = save_free_mb();
+    st.save_dir = s_save_dir.empty() ? "(disabled)" : s_save_dir.c_str();
     int n = bench_ctl_render_status(&st, &r, out, sizeof(out));
     if (n <= 0) {
       s_ctl_refused++;
@@ -1169,7 +1411,8 @@ void setup(void) {
                   "demo unavailable (set BM_SBC_GATEWAY_IPC to a writable "
                   "path)");
     }
-    ctl_init(); // bench control socket (S18 bite B); failure is non-fatal
+    save_dir_init(); // still-save target (S18 bite B); failure is non-fatal
+    ctl_init();      // bench control socket (S18 bite B); ditto
     bm_log_info("telemetry: node %016" PRIx64 " subscribed to %s, "
                 "ingest -> %s:%d, uplink every %" PRIu64 "s, ipc=%s, ctl=%s",
                 node_id(), k_camera_topic, s_ingest_host.c_str(),
