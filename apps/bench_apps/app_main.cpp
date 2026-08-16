@@ -34,6 +34,7 @@
 ///   S17_UPLINK_SECS    aggregated-uplink period, 0 = off (default 30)
 ///   BM_SBC_GATEWAY_IPC gateway_ipc socket path (shared with the python
 ///                      client; use /tmp/... on the bench)
+///   S18_CTL_SOCK       bench control socket (default /run/bm/bench.sock)
 ///
 /// Output markers (grepped by demo docs): LIGHT_STAT / TEL_STAT once
 /// per second; LIGHT_CMD on every accepted command.
@@ -48,11 +49,14 @@
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <fcntl.h> // O_NONBLOCK on the control socket
 #include <mutex>
 #include <poll.h>
 #include <string>
-#include <strings.h> // strcasecmp (res/pf CLI args)
+#include <strings.h>  // strcasecmp (res/pf CLI args)
+#include <sys/stat.h> // chmod (control socket)
 #include <sys/socket.h>
+#include <sys/un.h> // AF_UNIX control socket
 #include <unistd.h>
 #include <vector>
 
@@ -64,6 +68,7 @@ extern "C" {
 #include "spotter.h"       // spotter_tx_data -- THE shipped uplink (REV-8)
 }
 
+#include "bench_ctl.h" // control-socket wire format (parse + render)
 #include "bm_service.h"
 #include "bm_service_request.h"
 #include "chunk_reasm.h"
@@ -98,6 +103,18 @@ static const char *k_camera_topic = "camera/stream";
 #define CAMERA_PF_DEFAULT 0u
 #define CAMERA_PF_COLOR 1u
 #define CAMERA_PF_MONO 2u
+
+// Wire code -> operator-facing name. "?" for anything out of range: a
+// refused geometry must read as refused everywhere it is printed, never as
+// a plausible default.
+static const char *k_res_name[] = {"default", "qvga", "vga", "hd"};
+static const char *k_pf_name[] = {"default", "color", "mono"};
+static const char *res_name_of(uint8_t v) {
+  return v < (sizeof(k_res_name) / sizeof(k_res_name[0])) ? k_res_name[v] : "?";
+}
+static const char *pf_name_of(uint8_t v) {
+  return v < (sizeof(k_pf_name) / sizeof(k_pf_name[0])) ? k_pf_name[v] : "?";
+}
 
 struct __attribute__((packed)) camera_req_t {
   uint32_t magic;
@@ -363,6 +380,9 @@ static uint64_t s_ingest_frames = 0;
 static uint64_t s_ingest_fails = 0;
 static uint64_t s_frames_win = 0;
 static uint64_t s_bytes_win = 0;
+// Last completed TEL_STAT window, so the control socket reports the same
+// fps/kBps the journal prints instead of inventing a second measurement.
+static double s_fps_win = 0.0, s_kbps_win = 0.0;
 
 // pubsub RX thread: copy the payload and get out -- reassembly and the
 // (blocking) ingest socket live in loop() on the app thread.
@@ -475,6 +495,8 @@ static void telemetry_loop(void) {
   if (ms - s_last_stat_ms >= 1000) {
     double dt = (double)(ms - s_last_stat_ms) / 1000.0;
     s_last_stat_ms = ms;
+    s_fps_win = (double)s_frames_win / dt;
+    s_kbps_win = (double)s_bytes_win / dt / 1000.0;
     printf("TEL_STAT t=%.0f fps=%.1f kBps=%.1f frames_ok=%" PRIu32
            " dropped=%" PRIu32 " gaps=%" PRIu32 " hdr_errs=%" PRIu32
            " q_drops=%" PRIu64 " ingest_ok=%" PRIu64 " ingest_fail=%" PRIu64
@@ -498,30 +520,70 @@ static uint64_t s_uplink_next_ms = 0;
 static uint64_t s_uplink_sent = 0;
 static bool s_ipc_up = false;
 
+// --- what was commanded, and what came back (S18 bite B) -------------------
+//
+// Service replies arrive on middleware threads; the control socket is served
+// from loop(). One mutex covers the handful of scalars both touch. Nothing
+// here changes the BM path -- it only remembers what already went past, so
+// the web tool can ask "what did I command, and what did the chain answer?"
+// without scraping the journal.
+static std::mutex s_ctl_lock;
+static struct {
+  bool params_seen;
+  char last_cmd[BENCH_CTL_VERB_MAX];
+  double last_cmd_t;
+  int quality;
+  uint8_t res, pf;
+  double fps, mbps;
+  int secs;
+
+  bool cam_seen;
+  double cam_t;
+  const char *cam_state; // ok | timeout | bad_len
+  camera_rep_t cam;
+
+  bool light_seen;
+  double light_t;
+  const char *light_state;
+  light_rep_t light;
+} s_ctl;
+
 // Service replies (any thread) -> printed markers the demo greps.
+// Remember a reply for the control socket. `state` is a literal, so the
+// pointer outlives every reader.
+static void ctl_note_cam(const camera_rep_t *rep, const char *state) {
+  std::lock_guard<std::mutex> g(s_ctl_lock);
+  s_ctl.cam_seen = true;
+  s_ctl.cam_t = now_sec();
+  s_ctl.cam_state = state;
+  if (rep) {
+    s_ctl.cam = *rep;
+  }
+}
+
 static bool camera_reply_cb(bool ack, uint32_t msg_id, size_t /*slen*/,
                             const char * /*service*/, size_t reply_len,
                             uint8_t *reply_data) {
   if (!ack) {
     printf("CAM_REPLY id=%" PRIu32 " TIMEOUT\n", msg_id);
     fflush(stdout);
+    ctl_note_cam(nullptr, "timeout");
     return true;
   }
   camera_rep_t rep;
   if (reply_len != sizeof(rep)) {
     printf("CAM_REPLY id=%" PRIu32 " BAD_LEN %zu\n", msg_id, reply_len);
     fflush(stdout);
+    ctl_note_cam(nullptr, "bad_len");
     return false;
   }
   memcpy(&rep, reply_data, sizeof(rep));
-  static const char *res_name[] = {"default", "qvga", "vga", "hd"};
-  static const char *pf_name[] = {"default", "color", "mono"};
+  ctl_note_cam(&rep, "ok");
   printf("CAM_REPLY id=%" PRIu32 " ok=%u mode=%u res=%s pf=%s cmds=%" PRIu32
          " pub_ok=%" PRIu32 " pub_errs=%" PRIu32 " pub_bytes=%" PRIu32 "\n",
-         msg_id, rep.ok, rep.mode_active,
-         rep.res_active < 4 ? res_name[rep.res_active] : "?",
-         rep.pf_active < 3 ? pf_name[rep.pf_active] : "?", rep.cmds,
-         rep.pub_ok, rep.pub_errs, rep.pub_bytes);
+         msg_id, rep.ok, rep.mode_active, res_name_of(rep.res_active),
+         pf_name_of(rep.pf_active), rep.cmds, rep.pub_ok, rep.pub_errs,
+         rep.pub_bytes);
   if (!rep.ok) {
     printf("CAM_REPLY REFUSED — check res/pf spelling "
            "(res = qvga|vga|hd, pf = color|mono)\n");
@@ -530,21 +592,34 @@ static bool camera_reply_cb(bool ack, uint32_t msg_id, size_t /*slen*/,
   return true;
 }
 
+static void ctl_note_light(const light_rep_t *rep, const char *state) {
+  std::lock_guard<std::mutex> g(s_ctl_lock);
+  s_ctl.light_seen = true;
+  s_ctl.light_t = now_sec();
+  s_ctl.light_state = state;
+  if (rep) {
+    s_ctl.light = *rep;
+  }
+}
+
 static bool light_reply_cb(bool ack, uint32_t msg_id, size_t /*slen*/,
                            const char * /*service*/, size_t reply_len,
                            uint8_t *reply_data) {
   if (!ack) {
     printf("LIGHT_REPLY id=%" PRIu32 " TIMEOUT\n", msg_id);
     fflush(stdout);
+    ctl_note_light(nullptr, "timeout");
     return true;
   }
   light_rep_t rep;
   if (reply_len != sizeof(rep)) {
     printf("LIGHT_REPLY id=%" PRIu32 " BAD_LEN %zu\n", msg_id, reply_len);
     fflush(stdout);
+    ctl_note_light(nullptr, "bad_len");
     return false;
   }
   memcpy(&rep, reply_data, sizeof(rep));
+  ctl_note_light(&rep, "ok");
   printf("LIGHT_REPLY id=%" PRIu32 " ok=%u level=%u strobing=%u cmds=%" PRIu32
          " uptime=%" PRIu32 "s\n",
          msg_id, rep.ok, rep.level, rep.strobing, rep.cmds, rep.uptime_s);
@@ -581,9 +656,35 @@ static uint8_t parse_pf(const char *s) {
   return 0xFF;
 }
 
+// Record what was just commanded. Called from send_camera_req, so it covers
+// the FIFO CLI and the control socket identically -- the web tool's
+// "commanded" half can never drift from what the operator typed by hand.
+static void ctl_note_cmd(uint8_t cmd, uint8_t q, uint16_t fps_x10,
+                         uint32_t rate_bps, uint16_t secs, uint8_t res,
+                         uint8_t pf) {
+  const char *name = (cmd == CAMERA_CMD_CAPTURE)  ? "capture"
+                     : (cmd == CAMERA_CMD_STREAM) ? "stream"
+                     : (cmd == CAMERA_CMD_STOP)   ? "stop"
+                                                  : "cam-status";
+  std::lock_guard<std::mutex> g(s_ctl_lock);
+  s_ctl.params_seen = true;
+  snprintf(s_ctl.last_cmd, sizeof(s_ctl.last_cmd), "%s", name);
+  s_ctl.last_cmd_t = now_sec();
+  // A status query carries no parameters; leave the last real ones standing.
+  if (cmd == CAMERA_CMD_CAPTURE || cmd == CAMERA_CMD_STREAM) {
+    s_ctl.quality = q;
+    s_ctl.res = res;
+    s_ctl.pf = pf;
+    s_ctl.fps = (double)fps_x10 / 10.0;
+    s_ctl.mbps = (double)rate_bps / 1e6;
+    s_ctl.secs = secs;
+  }
+}
+
 static void send_camera_req(uint8_t cmd, uint8_t q, uint16_t fps_x10,
                             uint32_t rate_bps, uint16_t secs, uint8_t res,
                             uint8_t pf) {
+  ctl_note_cmd(cmd, q, fps_x10, rate_bps, secs, res, pf);
   camera_req_t req;
   memset(&req, 0, sizeof(req));
   req.magic = CAMERA_REQ_MAGIC;
@@ -766,6 +867,249 @@ static void uplink_tick(void) {
 }
 
 // ---------------------------------------------------------------------------
+// Telemetry role: bench control socket (S18 bite B)
+// ---------------------------------------------------------------------------
+//
+// AF_UNIX SOCK_DGRAM, non-blocking, drained from loop() -- the same shape as
+// the shipped gateway_ipc listener (src/net/gateway_ipc.cpp), for the same
+// reasons: one datagram is one complete message, so there is no framing code,
+// no partial-read buffer and no connection table to leak. It is node-local by
+// construction: no port exists on any interface.
+//
+// Default path /run/bm/bench.sock lives in the unit's RuntimeDirectory, so it
+// cannot outlive the process that reads it (S18 bite D's rule, and the reason
+// bm-cmd.sh refuses to write a FIFO nobody is reading).
+//
+// Every request gets exactly one reply, including the malformed ones. A
+// command that went nowhere must never look like a command that worked.
+
+static int s_ctl_fd = -1;
+static std::string s_ctl_path = "/run/bm/bench.sock";
+static uint64_t s_ctl_reqs = 0, s_ctl_refused = 0;
+
+static void ctl_init(void) {
+  const char *env = getenv("S18_CTL_SOCK");
+  if (env && env[0]) {
+    s_ctl_path = env;
+  }
+  int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (fd < 0) {
+    bm_log_warn("ctl: socket() failed (%s) -- web bench tool unavailable",
+                strerror(errno));
+    return;
+  }
+  int fl = fcntl(fd, F_GETFL, 0);
+  if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) {
+    bm_log_warn("ctl: O_NONBLOCK failed (%s)", strerror(errno));
+    close(fd);
+    return;
+  }
+  int fdfl = fcntl(fd, F_GETFD, 0);
+  if (fdfl >= 0) {
+    fcntl(fd, F_SETFD, fdfl | FD_CLOEXEC);
+  }
+  struct sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  if (s_ctl_path.size() >= sizeof(addr.sun_path)) {
+    bm_log_warn("ctl: path too long (%zu) -- socket not created",
+                s_ctl_path.size());
+    close(fd);
+    return;
+  }
+  strncpy(addr.sun_path, s_ctl_path.c_str(), sizeof(addr.sun_path) - 1);
+  unlink(s_ctl_path.c_str()); // a stale socket from a crashed run
+  if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    // Non-fatal on purpose: run the app by hand outside systemd and /run/bm
+    // does not exist. The BM path must not depend on the bench tool.
+    bm_log_warn("ctl: bind(%s) failed (%s) -- web bench tool unavailable "
+                "(is the unit's RuntimeDirectory there?)",
+                s_ctl_path.c_str(), strerror(errno));
+    close(fd);
+    return;
+  }
+  // Owner+group only: /run/bm is the unit's pi-owned RuntimeDirectory, and
+  // the bench web server runs as the same user. Not world-writable -- unlike
+  // gateway_ipc, this socket commands hardware.
+  if (chmod(s_ctl_path.c_str(), 0660) < 0) {
+    bm_log_warn("ctl: chmod(%s) failed (%s)", s_ctl_path.c_str(),
+                strerror(errno));
+  }
+  s_ctl_fd = fd;
+  bm_log_info("ctl: listening on %s (JSON in / JSON out)", s_ctl_path.c_str());
+}
+
+static void ctl_reply(const struct sockaddr_un *to, socklen_t tolen,
+                      const char *buf, size_t len) {
+  if (tolen <= (socklen_t)sizeof(sa_family_t)) {
+    // An unbound client cannot be replied to. Say so loudly once per
+    // occurrence: silence here would look exactly like a working command.
+    bm_log_warn("ctl: client is not bound to an address -- reply dropped "
+                "(the client must bind its own socket path)");
+    return;
+  }
+  if (sendto(s_ctl_fd, buf, len, MSG_DONTWAIT, (const struct sockaddr *)to,
+             tolen) < 0) {
+    bm_log_warn("ctl: sendto failed (%s)", strerror(errno));
+  }
+}
+
+// Dispatch one request. Verbs map 1:1 onto the FIFO CLI's handlers -- the
+// same send_camera_req / send_light_req calls, the same parse_res / parse_pf
+// pass-through -- so the socket and the operator CLI cannot drift apart.
+static void ctl_dispatch(const char *msg, size_t len,
+                         const struct sockaddr_un *from, socklen_t fromlen) {
+  static char out[BENCH_CTL_REPLY_MAX];
+  bench_ctl_req_t r;
+  s_ctl_reqs++;
+
+  if (!bench_ctl_parse_req(msg, len, &r)) {
+    s_ctl_refused++;
+    int n = bench_ctl_render_err(&r, r.err, out, sizeof(out));
+    if (n > 0) {
+      ctl_reply(from, fromlen, out, (size_t)n);
+    }
+    bm_log_warn("ctl: refused a request (%s)", r.err);
+    return;
+  }
+
+  const uint8_t q = (r.quality >= 0) ? (uint8_t)r.quality : 0;
+  const uint8_t res = r.res[0] ? parse_res(r.res) : CAMERA_RES_DEFAULT;
+  const uint8_t pf = r.pf[0] ? parse_pf(r.pf) : CAMERA_PF_DEFAULT;
+
+  if (strcmp(r.verb, "capture") == 0) {
+    send_camera_req(CAMERA_CMD_CAPTURE, q, 0, 0, 0, res, pf);
+  } else if (strcmp(r.verb, "stream") == 0) {
+    send_camera_req(CAMERA_CMD_STREAM, q,
+                    (r.fps >= 0) ? (uint16_t)(r.fps * 10) : 0,
+                    (r.mbps >= 0) ? (uint32_t)(r.mbps * 1e6) : 0,
+                    (r.secs >= 0) ? (uint16_t)r.secs : 0, res, pf);
+  } else if (strcmp(r.verb, "stop") == 0) {
+    send_camera_req(CAMERA_CMD_STOP, 0, 0, 0, 0, 0, 0);
+  } else if (strcmp(r.verb, "cam-status") == 0) {
+    send_camera_req(CAMERA_CMD_STATUS, 0, 0, 0, 0, 0, 0);
+  } else if (strcmp(r.verb, "light") == 0) {
+    send_light_req(LIGHT_CMD_LEVEL, (r.level >= 0) ? (uint8_t)r.level : 0, 0, 0,
+                   0);
+  } else if (strcmp(r.verb, "strobe") == 0) {
+    // Same defaults as the FIFO CLI's `strobe` with arguments omitted.
+    send_light_req(LIGHT_CMD_STROBE, 0,
+                   (r.on_ms >= 0) ? (uint16_t)r.on_ms : 200,
+                   (r.off_ms >= 0) ? (uint16_t)r.off_ms : 200,
+                   (r.count >= 0) ? (uint16_t)r.count : 5);
+  } else if (strcmp(r.verb, "light-status") == 0) {
+    send_light_req(LIGHT_CMD_QUERY, 0, 0, 0, 0);
+  } else if (strcmp(r.verb, "status") == 0) {
+    bench_ctl_status_t st;
+    bench_ctl_status_init(&st);
+    st.t = now_sec();
+    st.node = node_id();
+    {
+      std::lock_guard<std::mutex> g(s_ctl_lock);
+      st.params_seen = s_ctl.params_seen ? 1 : 0;
+      st.last_cmd = s_ctl.last_cmd;
+      st.last_cmd_t = s_ctl.last_cmd_t;
+      st.quality = s_ctl.quality;
+      st.res = res_name_of(s_ctl.res);
+      st.pf = pf_name_of(s_ctl.pf);
+      st.fps = s_ctl.fps;
+      st.mbps = s_ctl.mbps;
+      st.secs = s_ctl.secs;
+      st.cam_seen = s_ctl.cam_seen ? 1 : 0;
+      st.cam_t = s_ctl.cam_t;
+      st.cam_state = s_ctl.cam_state;
+      st.cam_ok = s_ctl.cam.ok;
+      st.cam_mode = s_ctl.cam.mode_active;
+      st.cam_res = res_name_of(s_ctl.cam.res_active);
+      st.cam_pf = pf_name_of(s_ctl.cam.pf_active);
+      st.cam_cmds = s_ctl.cam.cmds;
+      st.pub_ok = s_ctl.cam.pub_ok;
+      st.pub_errs = s_ctl.cam.pub_errs;
+      st.pub_bytes = s_ctl.cam.pub_bytes;
+      st.light_seen = s_ctl.light_seen ? 1 : 0;
+      st.light_t = s_ctl.light_t;
+      st.light_state = s_ctl.light_state;
+      st.light_ok = s_ctl.light.ok;
+      st.light_level = s_ctl.light.level;
+      st.light_strobing = s_ctl.light.strobing;
+      st.light_cmds = s_ctl.light.cmds;
+      st.light_uptime_s = s_ctl.light.uptime_s;
+    }
+    // The receiver ledger: the honest half of commanded-vs-actual (D21).
+    st.frames_ok = s_reasm.frames_ok;
+    st.frames_dropped = s_reasm.frames_dropped;
+    st.chunk_gaps = s_reasm.chunk_gaps;
+    st.hdr_errors = s_reasm.hdr_errors;
+    st.oversize = s_reasm.oversize;
+    {
+      std::lock_guard<std::mutex> g(s_q_lock);
+      st.q_drops = s_q_drops;
+    }
+    st.ingest_ok = s_ingest_frames;
+    st.ingest_fail = s_ingest_fails;
+    st.uplinks = s_uplink_sent;
+    st.fps_win = s_fps_win;
+    st.kbps_win = s_kbps_win;
+    st.ipc_up = s_ipc_up ? 1 : 0;
+    int n = bench_ctl_render_status(&st, &r, out, sizeof(out));
+    if (n <= 0) {
+      s_ctl_refused++;
+      n = bench_ctl_render_err(&r, "status did not fit the reply buffer", out,
+                               sizeof(out));
+    }
+    if (n > 0) {
+      ctl_reply(from, fromlen, out, (size_t)n);
+    }
+    return;
+  } else {
+    s_ctl_refused++;
+    char why[96];
+    snprintf(why, sizeof(why), "unknown cmd '%s'", r.verb);
+    int n = bench_ctl_render_err(&r, why, out, sizeof(out));
+    if (n > 0) {
+      ctl_reply(from, fromlen, out, (size_t)n);
+    }
+    return;
+  }
+
+  int n = bench_ctl_render_ack(&r, out, sizeof(out));
+  if (n > 0) {
+    ctl_reply(from, fromlen, out, (size_t)n);
+  }
+}
+
+static void ctl_poll(void) {
+  if (s_ctl_fd < 0) {
+    return;
+  }
+  for (;;) {
+    static char buf[BENCH_CTL_MSG_MAX];
+    struct sockaddr_un from;
+    socklen_t fromlen = sizeof(from);
+    memset(&from, 0, sizeof(from));
+    // MSG_TRUNC makes recvfrom report the datagram's REAL size even when it
+    // did not fit, so an oversize message is refused out loud instead of
+    // being parsed as whatever survived the truncation.
+    ssize_t n = recvfrom(s_ctl_fd, buf, sizeof(buf), MSG_TRUNC,
+                         (struct sockaddr *)&from, &fromlen);
+    if (n < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        return;
+      }
+      if (errno == EINTR) {
+        continue;
+      }
+      bm_log_warn("ctl: recvfrom failed (%s)", strerror(errno));
+      return;
+    }
+    if (n == 0) {
+      continue;
+    }
+    ctl_dispatch(buf, (size_t)n, &from, fromlen);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // App contract
 // ---------------------------------------------------------------------------
 
@@ -825,10 +1169,12 @@ void setup(void) {
                   "demo unavailable (set BM_SBC_GATEWAY_IPC to a writable "
                   "path)");
     }
+    ctl_init(); // bench control socket (S18 bite B); failure is non-fatal
     bm_log_info("telemetry: node %016" PRIx64 " subscribed to %s, "
-                "ingest -> %s:%d, uplink every %" PRIu64 "s, ipc=%s",
+                "ingest -> %s:%d, uplink every %" PRIu64 "s, ipc=%s, ctl=%s",
                 node_id(), k_camera_topic, s_ingest_host.c_str(),
-                s_ingest_port, s_uplink_secs, s_ipc_up ? "up" : "down");
+                s_ingest_port, s_uplink_secs, s_ipc_up ? "up" : "down",
+                s_ctl_fd >= 0 ? s_ctl_path.c_str() : "off");
     cli_help();
   }
 }
@@ -842,6 +1188,7 @@ void loop(void) {
       gateway_ipc_poll();
     }
     cli_poll();
+    ctl_poll();
     uplink_tick();
   }
 }

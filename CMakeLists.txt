@@ -249,3 +249,11 @@ target_include_directories(test_chunk_reasm PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/apps/bench_apps
 )
 add_test(NAME chunk_reasm COMMAND test_chunk_reasm)
+
+add_executable(test_bench_ctl
+  tests/test_bench_ctl.c
+)
+target_include_directories(test_bench_ctl PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/apps/bench_apps
+)
+add_test(NAME bench_ctl COMMAND test_bench_ctl)
