@@ -1252,7 +1252,10 @@ static void ctl_dispatch(const char *msg, size_t len,
       st.secs = s_ctl.secs;
       st.cam_seen = s_ctl.cam_seen ? 1 : 0;
       st.cam_t = s_ctl.cam_t;
-      st.cam_state = s_ctl.cam_state;
+      // Before the first reply this pointer is still NULL, and "%s" of NULL
+      // prints "(null)" -- which a client would read as a state the node
+      // was actually in. Keep the init value's "none".
+      st.cam_state = s_ctl.cam_state ? s_ctl.cam_state : "none";
       st.cam_ok = s_ctl.cam.ok;
       st.cam_mode = s_ctl.cam.mode_active;
       st.cam_res = res_name_of(s_ctl.cam.res_active);
@@ -1263,7 +1266,7 @@ static void ctl_dispatch(const char *msg, size_t len,
       st.pub_bytes = s_ctl.cam.pub_bytes;
       st.light_seen = s_ctl.light_seen ? 1 : 0;
       st.light_t = s_ctl.light_t;
-      st.light_state = s_ctl.light_state;
+      st.light_state = s_ctl.light_state ? s_ctl.light_state : "none";
       st.light_ok = s_ctl.light.ok;
       st.light_level = s_ctl.light.level;
       st.light_strobing = s_ctl.light.strobing;
